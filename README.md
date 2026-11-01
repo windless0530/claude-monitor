@@ -63,6 +63,15 @@ thinking、输出文本、请求的工具名、input/output/cache token；按 (s
 只收录能归属到轮次的消息（防 -c/--resume 把旧会话历史误记到新会话）。Stop 的退避重试与
 SessionEnd 兜底覆盖"最终响应晚于 Stop 落盘"的竞态。
 
+**raw input / raw output**：`raw_input` 为该次调用请求的 messages 历史，**对齐真实请求形状**——
+每条 `{role, content}`，连续行已合并（并行工具的多个 tool_result 在一条 user 消息的 content 数组里）、
+assistant 为完整块列表、剥离 transcript 元数据；从 transcript 重建，**不含** system prompt 与
+tools 定义。`raw_output` 为完整 assistant 消息（content 块原样，**含 tool_use 的完整入参**，非仅工具名）。两者各自限长
+`RAW_LIMIT`（默认 128K 字符）：input 超长从头部整条丢弃并插入 `_ccmon_truncated` 标记，
+output 超长对超长字符串叶子截断。页面推理行的「raw input / raw output」折叠区用 JSON 树展示。
+历史行回填：`python3 ~/cc-otel/toollog/ccmon-hook.py --backfill-raw`（仅主链——子代理
+sidechain transcript 路径未持久化，无法回填）。
+
 `toollog/ccmon-sessions-server.py`（127.0.0.1:7780，只读）+ `ccmon-sessions.html` 提供三级视图：
 会话列表 → 每轮用户命令卡片（开始/结束/耗时/调用数/推理数/最终输出）→ **融合时间线**（工具调用
 与 ✦ 模型推理按时间穿插；参数/响应用 VSCode 风格 JSON 树展示：key/类型着色、可折叠、大节点

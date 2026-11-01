@@ -328,6 +328,7 @@ import sys
 import time
 
 RESP_LIMIT = 65536  # ccmon:resp-limit  （ccmon setup 会按 TOOLLOG_RESP_LIMIT 重写此行）
+RAW_LIMIT  = 131072 # ccmon:raw-limit  （raw_input/raw_output 单列打包上限字符数）
 FINAL_SCAN = 262144 # Stop 时从 transcript 尾部倒扫的最大字节数
 LLM_SCAN   = 524288 # 收割 LLM 调用时从 transcript 尾部扫描的最大字节数
 
@@ -383,7 +384,9 @@ CREATE TABLE IF NOT EXISTS llm_calls(
   input_tokens  INTEGER,
   output_tokens INTEGER,
   cache_read_tokens INTEGER,
-  is_subagent  INTEGER NOT NULL DEFAULT 0
+  is_subagent  INTEGER NOT NULL DEFAULT 0,
+  raw_input   TEXT,
+  raw_output  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_llm_session ON llm_calls(session_id, llm_id);
 CREATE INDEX IF NOT EXISTS idx_llm_turn ON llm_calls(turn_id);
@@ -392,7 +395,9 @@ CREATE INDEX IF NOT EXISTS idx_llm_mid ON llm_calls(session_id, mid);
 
 def ensure_migration(conn): # 旧库升级（列存在则忽略报错）
     for ddl in ("ALTER TABLE sessions ADD COLUMN llm_watermark TEXT",
-                "ALTER TABLE turns ADD COLUMN llm_count INTEGER NOT NULL DEFAULT 0"):
+                "ALTER TABLE turns ADD COLUMN llm_count INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE llm_calls ADD COLUMN raw_input TEXT",
+                "ALTER TABLE llm_calls ADD COLUMN raw_output TEXT"):
         try:
             conn.execute(ddl)
         except Exception:
@@ -500,11 +505,150 @@ def on_post_tool(conn, evt, sid, ts):
         conn.execute("UPDATE turns SET tool_count=tool_count+1 WHERE turn_id=?", (tid,))
     harvest_llm(conn, sid, tp)
 
+def _shrink_strings(obj, leaf_limit):
+    """递归截断超长字符串叶子（保持 JSON 结构合法，raw_output 限长用）。"""
+    if isinstance(obj, str):
+        return obj if len(obj) <= leaf_limit else obj[:leaf_limit] + f"…[ccmon clipped {len(obj) - leaf_limit} chars]"
+    if isinstance(obj, list):
+        return [_shrink_strings(x, leaf_limit) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _shrink_strings(v, leaf_limit) for k, v in obj.items()}
+    return obj
+
+def pack_raw_obj(obj):
+    """dict（raw_output）→ 限长 JSON 字符串：逐级缩小叶子字符串截断，结构保持合法。"""
+    s = json.dumps(obj, ensure_ascii=False)
+    if len(s) <= RAW_LIMIT:
+        return s
+    leaf = 8192
+    while leaf >= 256:
+        s2 = json.dumps(_shrink_strings(obj, leaf), ensure_ascii=False)
+        if len(s2) <= RAW_LIMIT:
+            return s2
+        leaf //= 2
+    return json.dumps(_shrink_strings(obj, 256), ensure_ascii=False)
+
+def pack_raw_list_ser(ser):
+    """已序列化的消息列表 → 限长 JSON 数组（尾部按预算切片，每条只序列化一次，避免 O(n²)）。
+
+    超长时从头部整条丢弃（保留最近上下文），首位插入 {"_ccmon_truncated":...} 标记；
+    最晚一条单独超长时回退为叶子截断。
+    """
+    total = sum(len(s) for s in ser)
+    if total + len(ser) + 2 <= RAW_LIMIT:
+        return "[" + ",".join(ser) + "]"
+    budget = RAW_LIMIT - 512
+    take, acc = [], 0
+    for s in reversed(ser):
+        w = len(s) + 1
+        if take and acc + w > budget:
+            break
+        take.append(s)
+        acc += w
+    take.reverse()
+    mark = {"_ccmon_truncated": True, "dropped_messages": len(ser) - len(take),
+            "note": f"input 超过 {RAW_LIMIT} 字符，已从头部省略整条消息，仅保留最近上下文"}
+    kept = [json.loads(s) for s in take]
+    s2 = json.dumps([mark] + kept, ensure_ascii=False)
+    if len(s2) <= RAW_LIMIT:
+        return s2
+    leaf = 8192
+    while leaf >= 256:
+        s2 = json.dumps([mark] + [_shrink_strings(m, leaf) for m in kept], ensure_ascii=False)
+        if len(s2) <= RAW_LIMIT:
+            return s2
+        leaf //= 2
+    return json.dumps([mark] + [_shrink_strings(m, 256) for m in kept], ensure_ascii=False)
+
+def pack_raw_list(msgs):
+    """messages 数组 → 限长 JSON 字符串。"""
+    if not msgs:
+        return "[]"
+    return pack_raw_list_ser([json.dumps(m, ensure_ascii=False) for m in msgs])
+
+def parse_llm_transcript(data, is_main, wm):
+    """解析 transcript 文本 → (assistant 分组 groups/order, 折叠后的消息列表 inputs)。
+
+    inputs 收 user+assistant 两类消息（即 API 请求的 messages 历史，各自带 role/content）；
+    assistant 流式分片按 message.id 折叠为一条（取最晚/最完整的分片，位置保持首见处）。
+    """
+    groups, order, lines = {}, [], []
+    for line in data.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        rtype = rec.get("type")
+        if rtype not in ("user", "assistant"):
+            continue
+        if is_main and rec.get("isSidechain"):
+            continue
+        msg = rec.get("message") or {}
+        rts = rec.get("timestamp") or ""
+        if not rts:
+            continue
+        lines.append((rts, msg))
+        if rtype != "assistant":
+            continue
+        mid = msg.get("id") or rts
+        g = groups.get(mid)
+        if g is None:
+            g = groups[mid] = {"first": rts, "last": rts, "model": None, "stop": None,
+                               "blocks": [], "usage": None, "out": -1}
+            if not (wm and rts < wm):   # wm 之前的是历史，建组但不作为新调用收割
+                order.append(mid)
+        if rts > g["last"]:
+            g["last"] = rts
+        g["model"] = g["model"] or msg.get("model")
+        if msg.get("stop_reason"):
+            g["stop"] = msg.get("stop_reason")
+        g["blocks"].extend(c for c in (msg.get("content") or []) if isinstance(c, dict))
+        u = msg.get("usage") or {}
+        out = u.get("output_tokens")
+        if isinstance(out, int) and out >= g["out"]:
+            g["out"], g["usage"] = out, u
+    # —— 重构为真实 API 请求的 messages 形状 ——
+    # transcript 逐行记录：并行工具的每个 tool_result 各占一行 user（真实请求里是同一条
+    # 消息 content 数组里的多个块）；assistant 流式分片每行只带一个块。这里把连续 user
+    # 行合并为一条（content 拼接，字符串 prompt 归一为 text 块），assistant 取分组合并后的
+    # 完整块列表（引用 group.blocks，同组后续分片不重复入列），并剥掉 transcript 元数据
+    # （id/model/usage/stop_reason 等），每个元素只留 {role, content}。
+    seq = []
+    for rts, m in lines:
+        if m.get("role") == "assistant":
+            g = groups.get(m.get("id") or rts)
+            if g is None:
+                continue
+            if seq and seq[-1][2] is g:
+                continue
+            seq.append((g["first"], {"role": "assistant", "content": g["blocks"]}, g))
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            blocks = [{"type": "text", "text": c}] if c else []
+        elif isinstance(c, list):
+            blocks = [b for b in c if isinstance(b, dict)]
+        else:
+            continue
+        if not blocks:
+            continue
+        if seq and seq[-1][1]["role"] == "user":
+            seq[-1][1]["content"].extend(blocks)
+        else:
+            seq.append((rts, {"role": "user", "content": blocks}, None))
+    return groups, order, seq
+
 def harvest_llm(conn, sid, transcript_path):
     """从 transcript 尾部收割 LLM 推理调用（assistant 消息），写入 llm_calls。
 
     - 流式响应会把一次 API 调用拆成多行 assistant 记录（thinking 一行、tool_use 一行…），
       按 message.id 分组合并成一条，usage 取输出 token 数最大的分片（终值）。
+    - raw_input：本次调用请求里的 messages 历史（user/assistant 逐条 {role, content}，
+      从 transcript 重建；不含 system prompt 与 tools 定义）；raw_output：完整 assistant
+      消息（含 tool_use 的完整入参，非仅工具名）。两者均受 RAW_LIMIT 限长。
     - 幂等：入库前按 (session_id, mid) 查重；sessions.llm_watermark 只用来缩小扫描范围。
     - 只记能归属到某轮次（turn）的组，避免 -c/--resume 续接旧 transcript 时把历史会话的
       消息误记到新会话名下。
@@ -527,40 +671,7 @@ def harvest_llm(conn, sid, transcript_path):
             data = f.read().decode("utf-8", "replace")
     except Exception:
         return
-    groups = {}   # mid -> dict
-    order = []
-    for line in data.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except Exception:
-            continue
-        if rec.get("type") != "assistant":
-            continue
-        if is_main and rec.get("isSidechain"):
-            continue
-        rts = rec.get("timestamp") or ""
-        if not rts or (wm and rts < wm):
-            continue
-        msg = rec.get("message") or {}
-        mid = msg.get("id") or rts
-        g = groups.get(mid)
-        if g is None:
-            g = groups[mid] = {"first": rts, "last": rts, "model": None, "stop": None,
-                               "blocks": [], "usage": None, "out": -1}
-            order.append(mid)
-        if rts > g["last"]:
-            g["last"] = rts
-        g["model"] = g["model"] or msg.get("model")
-        if msg.get("stop_reason"):
-            g["stop"] = msg.get("stop_reason")
-        g["blocks"].extend(c for c in (msg.get("content") or []) if isinstance(c, dict))
-        u = msg.get("usage") or {}
-        out = u.get("output_tokens")
-        if isinstance(out, int) and out >= g["out"]:
-            g["out"], g["usage"] = out, u
+    groups, order, seq = parse_llm_transcript(data, is_main, wm)
     max_ts = wm or ""
     for mid in order:
         g = groups[mid]
@@ -576,18 +687,60 @@ def harvest_llm(conn, sid, transcript_path):
         text = "\n".join(c.get("text", "") for c in g["blocks"] if c.get("type") == "text").strip()
         names = [c.get("name", "?") for c in g["blocks"] if c.get("type") == "tool_use"]
         u = g["usage"] or {}
+        raw_in = pack_raw_list([m for t, m, _ in seq if t < g["first"]])
+        raw_out = pack_raw_obj({"id": mid, "role": "assistant", "content": g["blocks"],
+                                "model": g["model"], "stop_reason": g["stop"], "usage": g["usage"]})
         conn.execute(
             "INSERT INTO llm_calls(session_id, turn_id, ts, mid, model, stop_reason, thinking, text,"
-            " tool_uses, input_tokens, output_tokens, cache_read_tokens, is_subagent)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " tool_uses, input_tokens, output_tokens, cache_read_tokens, is_subagent, raw_input, raw_output)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (sid, tid, g["last"], mid, g["model"], g["stop"],
              clip(thinking) or None, clip(text) or None,
              json.dumps(names, ensure_ascii=False) if names else None,
              u.get("input_tokens"), u.get("output_tokens"), u.get("cache_read_input_tokens"),
-             0 if is_main else 1))
+             0 if is_main else 1, raw_in, raw_out))
         conn.execute("UPDATE turns SET llm_count=llm_count+1 WHERE turn_id=?", (tid,))
     if max_ts and max_ts > (wm or ""):
         conn.execute("UPDATE sessions SET llm_watermark=? WHERE session_id=?", (max_ts, sid))
+
+def backfill_raw(conn):
+    """一次性回填：为已有 llm_calls 行补 raw_input/raw_output（主链；transcript 需仍在磁盘）。
+
+    子代理调用（is_subagent=1）的 sidechain transcript 路径未持久化，无法回填，跳过并计数。
+    """
+    rows = conn.execute(
+        "SELECT l.llm_id, l.session_id, l.mid FROM llm_calls l"
+        " JOIN sessions s ON s.session_id = l.session_id"
+        " WHERE l.is_subagent=0 AND l.raw_input IS NULL AND s.main_transcript IS NOT NULL"
+        " ORDER BY l.llm_id").fetchall()
+    by_sid = {}
+    for r in rows:
+        by_sid.setdefault(r["session_id"], []).append((r["llm_id"], r["mid"]))
+    done = skip = 0
+    for sid, items in by_sid.items():
+        tp = conn.execute("SELECT main_transcript FROM sessions WHERE session_id=?", (sid,)).fetchone()[0]
+        try:
+            with open(tp, "rb") as f:
+                data = f.read().decode("utf-8", "replace")
+        except Exception:
+            skip += len(items)
+            continue
+        groups, _order, seq = parse_llm_transcript(data, True, None)
+        ser = [json.dumps(m, ensure_ascii=False) for _t, m, _g in seq]  # 整会话只序列化一次
+        tss = [t for t, _m, _g in seq]
+        for llm_id, mid in items:
+            g = groups.get(mid)
+            if g is None:
+                skip += 1
+                continue
+            raw_in = pack_raw_list_ser([s for t, s in zip(tss, ser) if t < g["first"]])
+            raw_out = pack_raw_obj({"id": mid, "role": "assistant", "content": g["blocks"],
+                                    "model": g["model"], "stop_reason": g["stop"], "usage": g["usage"]})
+            conn.execute("UPDATE llm_calls SET raw_input=?, raw_output=? WHERE llm_id=?",
+                         (raw_in, raw_out, llm_id))
+            done += 1
+        conn.commit()
+    print(f"backfill_raw: filled={done} skipped={skip}", flush=True)
 
 def on_stop(conn, evt, sid, ts):
     row = conn.execute(
@@ -618,6 +771,17 @@ def main():
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
         ensure_migration(conn)
+        conn.commit()
+        conn.close()
+        return 0
+    if "--backfill-raw" in sys.argv:  # 一次性回填历史行的 raw_input/raw_output
+        conn = sqlite3.connect(DB, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(SCHEMA)
+        ensure_migration(conn)
+        conn.commit()
+        backfill_raw(conn)
         conn.commit()
         conn.close()
         return 0
@@ -752,7 +916,9 @@ CREATE TABLE IF NOT EXISTS llm_calls(
   input_tokens  INTEGER,
   output_tokens INTEGER,
   cache_read_tokens INTEGER,
-  is_subagent  INTEGER NOT NULL DEFAULT 0
+  is_subagent  INTEGER NOT NULL DEFAULT 0,
+  raw_input   TEXT,
+  raw_output  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_llm_session ON llm_calls(session_id, llm_id);
 CREATE INDEX IF NOT EXISTS idx_llm_turn ON llm_calls(turn_id);
@@ -774,7 +940,9 @@ class AppState:
         try:
             c.executescript(SCHEMA)
             for ddl in ("ALTER TABLE sessions ADD COLUMN llm_watermark TEXT",
-                        "ALTER TABLE turns ADD COLUMN llm_count INTEGER NOT NULL DEFAULT 0"):
+                        "ALTER TABLE turns ADD COLUMN llm_count INTEGER NOT NULL DEFAULT 0",
+                        "ALTER TABLE llm_calls ADD COLUMN raw_input TEXT",
+                        "ALTER TABLE llm_calls ADD COLUMN raw_output TEXT"):
                 try:
                     c.execute(ddl)
                 except Exception:
@@ -927,7 +1095,8 @@ def make_handler(state):
                     (int(tid),)).fetchall()
                 llm = c.execute(
                     "SELECT llm_id, session_id, turn_id, ts, model, stop_reason, thinking, text,"
-                    " tool_uses, input_tokens, output_tokens, cache_read_tokens, is_subagent"
+                    " tool_uses, input_tokens, output_tokens, cache_read_tokens, is_subagent,"
+                    " raw_input, raw_output"
                     " FROM llm_calls WHERE turn_id=? ORDER BY ts ASC, llm_id ASC LIMIT 2000",
                     (int(tid),)).fetchall()
             finally:
@@ -1157,6 +1326,13 @@ function llmRow(l,turnId){
   const body=[];
   if(l.thinking)body.push(`<details class="think" data-dkey="t${turnId}l${l.llm_id}-th"><summary>思考过程</summary><pre>${esc(l.thinking)}</pre></details>`);
   if(l.text)body.push(`<details class="think" data-dkey="t${turnId}l${l.llm_id}-tx"><summary>输出文本</summary><pre>${esc(l.text)}</pre></details>`);
+  if(l.raw_input||l.raw_output){
+    const rk=`t${turnId}l${l.llm_id}-raw`;
+    body.push(`<details class="json" data-dkey="${rk}"><summary>raw input / raw output</summary>`+
+      (l.raw_input?`<div class="jsec">raw_input（messages 历史，超长已从头部截断）</div>${jsonTree(l.raw_input,rk+"i")}`:"")+
+      (l.raw_output?`<div class="jsec">raw_output（完整 assistant 消息，含工具入参）</div>${jsonTree(l.raw_output,rk+"o")}`:"")+
+      `</details>`);
+  }
   if(chips)body.push(`<div style="margin-top:2px">${chips}</div>`);
   return `<div class="tlrow llm">
     <span class="seq">✦</span><span class="tltime">${fmtT(l.ts)}</span>
