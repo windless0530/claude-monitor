@@ -851,7 +851,10 @@ write_toollog_server() { # 只读 HTTP 服务（python3 stdlib，无第三方依
 
 - GET /                     页面（--html 指定的文件）
 - GET /api/health           健康检查 + 行数统计（ccmon status 用）
-- GET /api/sessions         会话列表（按最近活跃倒序）
+- GET /api/sessions         会话列表（按最近活跃倒序，每页 50）
+                           ?scope=active|all（默认 active，只看活跃中的）
+                           &page=N（越界自动收敛到最后一页）
+                           &q=关键词（cwd / last_prompt / session_id 模糊匹配）
 - GET /api/sessions/<id>    会话详情 + 轮次列表
 - GET /api/turns/<id>       轮次详情 + 工具调用列表
 - 后台线程按 --retention-days 清理旧数据（0=永久保留）
@@ -864,6 +867,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
 
 # 与 ccmon-hook.py 里的 SCHEMA 保持一致（服务启动时兜底建表/迁移，避免老库在 hook 首跑前查询报错）
 SCHEMA = """
@@ -924,6 +928,9 @@ CREATE INDEX IF NOT EXISTS idx_llm_session ON llm_calls(session_id, llm_id);
 CREATE INDEX IF NOT EXISTS idx_llm_turn ON llm_calls(turn_id);
 CREATE INDEX IF NOT EXISTS idx_llm_mid ON llm_calls(session_id, mid);
 """
+
+ACTIVE_WINDOW_S = 15 * 60  # 「活跃」判定窗口（秒），与前端 active() 口径保持一致
+PER_PAGE = 50              # /api/sessions 每页条数
 
 def jdump(obj):
     return json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -1007,14 +1014,15 @@ def make_handler(state):
             self.wfile.write(body)
 
         def do_GET(self):
-            path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            path, _, query = self.path.partition("?")
+            path = path.rstrip("/") or "/"
             try:
                 if path == "/":
                     self.serve_index()
                 elif path == "/api/health":
                     self.serve_health()
                 elif path == "/api/sessions":
-                    self.serve_sessions()
+                    self.serve_sessions(query)
                 elif path.startswith("/api/sessions/"):
                     self.serve_session(path[len("/api/sessions/"):])
                 elif path.startswith("/api/turns/"):
@@ -1055,16 +1063,47 @@ def make_handler(state):
                 c.close()
             self.send_json({"ok": True, "db": state.db_path, "counts": counts})
 
-        def serve_sessions(self):
+        def serve_sessions(self, query):
+            q = parse_qs(query)
+            scope = "all" if q.get("scope", ["active"])[0] == "all" else "active"
+            try:
+                page = max(1, int(q.get("page", ["1"])[0]))
+            except ValueError:
+                page = 1
+            kw = (q.get("q", [""])[0] or "").strip()
+            cutoff = time.strftime("%Y-%m-%dT%H:%M:%S.000Z",
+                                   time.gmtime(time.time() - ACTIVE_WINDOW_S))
+            where, params = [], []
+            if scope == "active":  # 与前端 active() 同口径：未结束，或 15 分钟内仍有活动
+                where.append("(s.ended_at IS NULL OR COALESCE(s.last_activity, s.started_at) > ?)")
+                params.append(cutoff)
+            if kw:
+                like = "%" + kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+                where.append("(s.cwd LIKE ? ESCAPE '\\' OR s.last_prompt LIKE ? ESCAPE '\\'"
+                             " OR s.session_id LIKE ? ESCAPE '\\')")
+                params += [like] * 3
+            wsql = (" WHERE " + " AND ".join(where)) if where else ""
             c = state.conn()
             try:
+                total = c.execute("SELECT COUNT(*) FROM sessions s" + wsql, params).fetchone()[0]
+                pages = max(1, (total + PER_PAGE - 1) // PER_PAGE)
+                page = min(page, pages)  # 数据变少时把越界页码收回最后一页
                 rows = c.execute(
                     "SELECT s.*, (SELECT COUNT(*) FROM llm_calls l WHERE l.session_id=s.session_id) AS llm_count"
-                    " FROM sessions s ORDER BY COALESCE(s.last_activity, s.started_at) DESC LIMIT 200"
-                ).fetchall()
+                    f" FROM sessions s{wsql} ORDER BY COALESCE(s.last_activity, s.started_at) DESC"
+                    " LIMIT ? OFFSET ?",
+                    params + [PER_PAGE, (page - 1) * PER_PAGE]).fetchall()
+                counts = {  # 两种口径的总数都带上，前端切换按钮要显示对面数量
+                    "active": c.execute(
+                        "SELECT COUNT(*) FROM sessions s WHERE s.ended_at IS NULL"
+                        " OR COALESCE(s.last_activity, s.started_at) > ?", (cutoff,)).fetchone()[0],
+                    "all": c.execute("SELECT COUNT(*) FROM sessions").fetchone()[0],
+                }
             finally:
                 c.close()
-            self.send_json([row2dict(r) for r in rows])
+            self.send_json({"scope": scope, "page": page, "per": PER_PAGE, "pages": pages,
+                            "total": total, "counts": counts,
+                            "rows": [row2dict(r) for r in rows]})
 
         def serve_session(self, sid):
             c = state.conn()
@@ -1159,7 +1198,19 @@ write_toollog_html() { # 可视化页面（单文件，hash 路由，兼容 ngin
   header h1{font-size:16px;margin:0;font-weight:600}
   header h1 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);margin-right:6px;vertical-align:1px}
   #back{display:none;cursor:pointer;color:var(--accent);border:1px solid var(--border);background:var(--card);border-radius:6px;padding:3px 10px;font-size:13px}
-  #filter{margin-left:auto;background:var(--card);border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:5px 10px;font-size:13px;width:220px}
+  #scope-group{margin-left:auto;display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:var(--card)}
+  #scope-group button{cursor:pointer;color:var(--dim);background:transparent;border:0;padding:4px 12px;font-size:13px;line-height:1.5}
+  #scope-group button+button{border-left:1px solid var(--border)}
+  #scope-group button:hover{color:var(--fg);background:#1c2129}
+  #scope-group button.on{color:var(--fg);font-weight:600;background:#21262d;box-shadow:inset 0 2px 5px rgba(1,4,9,.45)}
+  #scope-group .n{color:var(--dim);font-weight:400;font-size:12px;margin-left:2px}
+  #filter{background:var(--card);border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:5px 10px;font-size:13px;width:220px}
+  #pager{display:flex;align-items:center;justify-content:center;flex-wrap:wrap;gap:12px;max-width:1100px;margin:-12px auto 26px;color:var(--dim);font-size:13px}
+  #pager[hidden]{display:none}
+  #pager button{cursor:pointer;color:var(--accent);border:1px solid var(--border);background:var(--card);border-radius:6px;padding:3px 12px;font-size:13px}
+  #pager button:disabled{opacity:.4;cursor:default}
+  #pgin{width:3.4em;text-align:center;background:var(--card);border:1px solid var(--border);color:var(--fg);border-radius:4px;padding:2px 4px;font-size:13px}
+  #pgin:focus{outline:none;border-color:var(--accent)}
   main{max-width:1100px;margin:0 auto;padding:20px}
   .card{background:var(--card);border:1px solid var(--border);border-radius:10px;margin-bottom:14px;overflow:hidden}
   .srow{display:flex;align-items:center;gap:14px;padding:12px 16px;cursor:pointer;flex-wrap:wrap}
@@ -1218,15 +1269,36 @@ write_toollog_html() { # 可视化页面（单文件，hash 路由，兼容 ngin
 <header>
   <button id="back">← 会话列表</button>
   <h1><span class="dot"></span>Session Monitor</h1>
+  <div id="scope-group" role="group" aria-label="会话显示范围">
+    <button id="sc-active" class="on" aria-pressed="true">活跃中 <span class="n">…</span></button>
+    <button id="sc-all" aria-pressed="false">全部 <span class="n">…</span></button>
+  </div>
   <input id="filter" placeholder="过滤：目录 / 命令 / 会话 id…">
 </header>
 <div id="err"></div>
 <main id="view"><div class="empty">加载中…</div></main>
+<div id="pager" hidden>
+  <button id="pgprev">← 上一页</button>
+  <span id="pgmid">第 <input id="pgin" inputmode="numeric" autocomplete="off" title="输入页码，回车跳转"> / <span id="pgmax">1</span> 页 · </span><span id="pgcnt">共 <span id="pgtot">0</span> 个会话</span>
+  <button id="pgnext">下一页 →</button>
+</div>
 <script>
 "use strict";
 const $=s=>document.querySelector(s);
 const view=$("#view"), errBox=$("#err");
-let openTurns=new Set(), callsCache={}, llmCache={}, lastHtml=null;
+let openTurns=new Set(), callsCache={}, llmCache={}, lastHtml=null, listSeq=0;
+// 列表视图状态：默认只看活跃中的会话；scope/page 同步进 URL query，刷新不丢
+let scope="active", page=1, pagesMax=1;
+{const u=new URLSearchParams(location.search);
+ if(u.get("scope")==="all")scope="all";
+ const p=parseInt(u.get("page")||"1",10);if(Number.isInteger(p)&&p>1)page=p}
+function syncUrl(){
+  const u=new URLSearchParams();
+  if(scope==="all")u.set("scope","all");
+  if(page>1)u.set("page",String(page));
+  const s=u.toString(), url=location.pathname+(s?"?"+s:"")+location.hash;
+  if(location.pathname+location.search+location.hash!==url)history.replaceState(null,"",url);
+}
 
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmtT=iso=>{if(!iso)return"—";const d=new Date(iso);return isNaN(d)?iso:d.toLocaleTimeString("zh-CN",{hour12:false})};
@@ -1366,9 +1438,12 @@ function turnCard(t){
       <div class="final">${esc(t.final_output||"（无文本输出）")}</div>`:""}
   </div>`;
 }
-function renderList(rows,f){
-  if(f){const q=f.toLowerCase();rows=rows.filter(s=>(s.cwd||"").toLowerCase().includes(q)||(s.last_prompt||"").toLowerCase().includes(q)||(s.session_id||"").includes(q))}
-  if(!rows.length)return'<div class="empty">暂无会话记录</div>';
+function renderList(d,q){
+  const rows=d.rows;
+  if(!rows.length){
+    const msg=q?"没有匹配的会话":(d.scope==="active"?"当前没有活跃中的会话":"暂无会话记录");
+    return `<div class="empty">${msg}</div>`;
+  }
   return rows.map(s=>`<div class="card"><div class="srow" data-sid="${esc(s.session_id)}">
     <span class="t">${fmtD(s.started_at)}</span>
     <span class="cwd">${esc((s.cwd||"").replace(/^\/home\/[^/]+/,"~"))}</span>
@@ -1378,6 +1453,19 @@ function renderList(rows,f){
     <span class="badge count">${s.llm_count||0} 推理</span>
     <span class="badge ${active(s)?"on":""}">${active(s)?"进行中":fmtT(s.ended_at)}</span>
   </div></div>`).join("");
+}
+// 翻页条（#view 之外的常驻 DOM：重渲染列表不会打断输入框的焦点/未提交内容）
+function updatePager(d){
+  pagesMax=d.pages;
+  $("#pgmax").textContent=d.pages;
+  $("#pgtot").textContent=d.total;
+  const single=d.pages<=1;
+  $("#pgprev").style.display=$("#pgnext").style.display=$("#pgmid").style.display=single?"none":"";
+  $("#pgprev").disabled=d.page<=1;
+  $("#pgnext").disabled=d.page>=d.pages;
+  $("#pager").hidden=false;
+  const e=$("#pgin");
+  if(document.activeElement!==e)e.value=d.page;  // 正在输入时不覆盖
 }
 function renderSession(d){
   const s=d.session;
@@ -1395,6 +1483,7 @@ async function refresh(){
     errBox.style.display="none";
     const h=location.hash;
     if(h.startsWith("#/s/")){
+      $("#pager").hidden=true;
       const sid=decodeURIComponent(h.slice(4));
       const d=await getJSON("api/sessions/"+encodeURIComponent(sid));
       await Promise.all(d.turns.filter(t=>openTurns.has(t.turn_id)).map(async t=>{
@@ -1417,11 +1506,24 @@ async function refresh(){
         });
       }
     }else{
-      const rows=await getJSON("api/sessions");
-      const html=renderList(rows,$("#filter").value.trim());
+      const seq=++listSeq;  // 列表请求序号：慢的旧响应晚到时直接丢弃，避免覆盖新状态
+      const q=$("#filter").value.trim();
+      const d=await getJSON("api/sessions?scope="+scope+"&page="+page+"&q="+encodeURIComponent(q));
+      if(seq!==listSeq)return;
+      if(d.page!==page){page=d.page;syncUrl()}  // 服务端收敛了越界页码
+      const aOn=scope==="active", act=$("#sc-active"), all=$("#sc-all");
+      act.classList.toggle("on",aOn);all.classList.toggle("on",!aOn);
+      act.setAttribute("aria-pressed",String(aOn));all.setAttribute("aria-pressed",String(!aOn));
+      const an=act.querySelector(".n"), nn=all.querySelector(".n");
+      if(an.textContent!==String(d.counts.active))an.textContent=d.counts.active;
+      if(nn.textContent!==String(d.counts.all))nn.textContent=d.counts.all;
+      const html=renderList(d,q);
       if(html!==lastHtml){view.innerHTML=html;lastHtml=html}
+      if(d.rows.length)updatePager(d);
+      $("#pager").hidden=!d.rows.length;  // 空结果时连翻页条一起收起
     }
-  }catch(e){errBox.textContent="加载失败: "+e.message;errBox.style.display="block"}
+  }catch(e){errBox.textContent="加载失败: "+e.message;errBox.style.display="block";
+    const pe=$("#pgin");if(pe&&document.activeElement!==pe)pe.value=page}
 }
 view.addEventListener("click",e=>{
   const more=e.target.closest(".jstr-more");   // 长字符串展开
@@ -1449,13 +1551,40 @@ view.addEventListener("click",e=>{
   if(th){const id=+th.dataset.turn;openTurns.has(id)?openTurns.delete(id):openTurns.add(id);lastHtml=null;refresh()}
 });
 $("#back").addEventListener("click",()=>{location.hash=""});
-$("#filter").addEventListener("input",()=>{lastHtml=null;refresh()});
+$("#scope-group").addEventListener("click",e=>{  // 活跃中 / 全部 分段切换
+  const b=e.target.closest("button");if(!b)return;
+  const s=b.id==="sc-all"?"all":"active";
+  if(s!==scope){scope=s;page=1;lastHtml=null;syncUrl();refresh()}
+});
+$("#filter").addEventListener("input",()=>{page=1;lastHtml=null;syncUrl();refresh()});
+// ---------- 手动跳页（输入容错：非数字即剥、空/非法还原、越界收敛、Esc 还原、失焦提交） ----------
+const pgin=$("#pgin");
+pgin.addEventListener("input",()=>{pgin.value=pgin.value.replace(/\D/g,"").slice(0,4)});
+function pgCommit(){ // 幂等：重复提交（回车→失焦连击）自然落空
+  const v=pgin.value;
+  if(v===""){pgin.value=page;return}
+  const n=parseInt(v,10);
+  if(!Number.isInteger(n)){pgin.value=page;return}
+  const target=Math.max(1,Math.min(n,pagesMax));
+  if(target!==page){page=target;lastHtml=null;syncUrl();refresh()}
+  else pgin.value=page;
+}
+pgin.addEventListener("keydown",e=>{
+  if(e.key==="Enter"){e.preventDefault();pgCommit();pgin.blur()}
+  else if(e.key==="Escape"){pgin.value=page;pgin.blur()}
+});
+pgin.addEventListener("blur",()=>pgCommit());
+$("#pgprev").addEventListener("click",()=>{if(page>1){page--;lastHtml=null;syncUrl();refresh()}});
+$("#pgnext").addEventListener("click",()=>{if(page<pagesMax){page++;lastHtml=null;syncUrl();refresh()}});
 window.addEventListener("hashchange",()=>{
-  $("#back").style.display=location.hash.startsWith("#/s/")?"inline-block":"none";
+  const detail=location.hash.startsWith("#/s/");
+  $("#back").style.display=detail?"inline-block":"none";
+  $("#scope-group").style.display=detail?"none":"";
   openTurns.clear();callsCache={};llmCache={};lastHtml=null;refresh();
-  if(!location.hash.startsWith("#/s/"))$("#filter").focus();
+  if(!detail)$("#filter").focus();
 });
 $("#back").style.display=location.hash.startsWith("#/s/")?"inline-block":"none";
+$("#scope-group").style.display=location.hash.startsWith("#/s/")?"none":"";
 refresh();
 setInterval(()=>{if(document.visibilityState==="visible")refresh()},5000);
 </script>
